@@ -1,0 +1,281 @@
+#!/bin/sh
+
+# Define the SD card target content
+# Format is:
+# PX="<offset>,<size>,<type>,<format>,<source>"
+# where all numbers are in M or k or bytes:
+# - <offset>:    is the offset of the file or partition on the sdcard. Leave 'default' for auto calculation.
+# - <size>:      is the size of the partition or file. The file will be truncated is size is smaller than filesize. Leave default for auto calculation.
+# - <type>:      is the filesystem id. Add a * to tell the partition is bootable
+# - <format>:    is [ file[.offset] | archive.[fs] | partition.[fs] ]
+# 	- <file>:       flash a raw file on no partition. the .offset is optional and allow to skip the begining of the file
+# 	- <archive>:    format a new partition, mount it and extract the archive in it
+# 	- <partition>:  create an empty partition (with or without fs)
+# 	- [fs]:         represents the extension used with mkfs. It is mandatory for archive and optional for partition
+# - <source>:    is the file to flash
+# - 'default':   means auto calculate
+
+if [ -f $(dirname $1)/profile ]; then
+	. profile
+else
+	# example: i.MX6 linux sdcard
+	P1="1k,default,default,file.1k,u-boot.bin"
+	P2="1M,default,default,file,uImage"
+	P3="10M,100M,83*,archive.ext2,rootfs.tar.gz"
+	P4="default,default,83,partition.ext2,default"
+fi
+
+###########################
+##      utilities        ##
+###########################
+convert_to_sectors()
+{
+	# convert bytes into sectors
+	VALUE=$1
+	echo $((VALUE/sector_size))
+}
+
+convert_to_bytes()
+{
+	# convert MB / kB into bytes
+	VALUE=$1
+	if [ "${VALUE%M}" != "$VALUE" ]; then
+		VALUE=${VALUE%M}
+		echo $((VALUE*1024*1024))
+	elif [ "${VALUE%k}" != "$VALUE" ]; then
+		VALUE=${VALUE%k}
+		echo $((VALUE*1024))
+	else
+		echo $VALUE
+	fi
+}
+
+calculate_geometry()
+{
+	# calcuilate the geometry of the output device
+	total=$(fdisk -l $1 | grep "^Disk $1" | cut -d" " -f5)
+	geometry=$(fdisk -l $1 | grep heads | grep sectors | grep cylinders)
+	sectors=$(echo $geometry | cut -d" " -f8)
+	cylinders=$(echo $geometry | cut -d" " -f5)
+	heads=$(echo $geometry | cut -d" " -f1)
+	sector_size=$((total/sectors))
+	cylinder_size=$((total/cylinders))
+}
+
+get_partition_param()
+{
+	# retrieve on of the partition params
+	OFFSET=1
+	SIZE=2
+	TYPE=3
+	FORMAT=4
+	SOURCE=5
+
+	field=$(eval echo \$$2);
+	echo -n "$1" | cut -d"," -f$field
+}
+
+get_param_name()
+{
+	# for params with option: extract the name part
+	echo -n "$1" | cut -d"." -f1
+}
+
+get_param_opt()
+{
+	# for params with option: extract the option part
+	echo -n "$1" | cut -d"." -f2
+}
+
+get_block_size()
+{
+	# retrieve the unit inside the size parameter
+	SIZE=$1
+	if [ "${SIZE%M}" != "$SIZE" ]; then
+		echo -n "1M"
+	elif [ "${SIZE%k}" != "$SIZE" ]; then
+		echo -n "1k"
+	else
+		echo -n "1"
+	fi
+}
+
+get_block_count()
+{
+	# retrieve the value inside the size parameter
+	SIZE=$1
+	if [ "${SIZE%M}" != "$SIZE" ]; then
+		echo -n "${SIZE%M}"
+	elif [ "${SIZE%k}" != "$SIZE" ]; then
+		echo -n "${SIZE%k}"
+	else
+		echo -n "$SIZE"
+	fi
+}
+
+do_basic_checks()
+{
+	SUDO=
+	# Check for root user
+	[ "$(whoami)" = "root" ] || SUDO=sudo 
+
+	if [ "$#" -lt 1 ]; then
+		echo "Missing destination block device: [ /dev/sdX | /dev/mmcblkX ]"
+		exit 1
+	fi
+
+	SDCARD=$1
+	# Convert sdcard path to absolute
+	if [ "${SDCARD#/}" = "$SDCARD" ]; then
+		SDCARD=$(cd $PWD/$(dirname $SDCARD) && pwd)/$(basename $SDCARD)
+	else
+		SDCARD=$(cd $(dirname $SDCARD) && pwd)/$(basename $SDCARD)
+	fi
+	SDCARD=$(dirname $SDCARD)/$(basename $SDCARD)
+
+	# Simple protection: /dev/sda is usually the host HDD 
+	if [ "$SDCARD" = "/dev/sda" ]; then
+		echo "Cowardly refusing to erase /dev/sda"
+		exit 1
+	fi
+
+	# Detect if the target is a sdX or mmcblkX
+	if [ -z "$(echo $SDCARD | grep mmcblk)" ]; then
+		SDCARD_PART=${SDCARD}
+	else
+		SDCARD_PART=${SDCARD}p
+	fi
+}
+
+###########################
+##       main            ##
+###########################
+do_basic_checks $*
+calculate_geometry $SDCARD
+
+# Ask for user's confirmation
+echo "output device geometry: [$SDCARD]"
+echo " - total size: $total bytes / $((total / 1024 / 1024))MB"
+echo " - heads: $heads"
+echo " - cylinders: $cylinders"
+echo " - sectors: $sectors"
+echo " - sector_size: $sector_size"
+echo "Do you want to flash $SDCARD? (y|N)"
+read ans
+[ "$ans" = "y" -o "$ans" = "Y" -o "$ans" = "yes" -o "$ans" = "YES" -o "$ans" = "Yes" ] || exit 1
+
+# umount sdcard and create the partition table:
+echo "=========== Partition MicroSD ==========="
+$SUDO umount $SDCARD_PART* 2> /dev/null
+
+pos=0
+count=1
+while true; do
+	BOOT=""
+	PARTITION=$(eval echo \$P$count);
+	[ -z "$PARTITION" ] && break;
+	count=$((count+1))
+	
+	# retrieve parameters
+	FORMAT=$(get_partition_param $PARTITION FORMAT)
+	FORMAT=$(get_param_name $FORMAT)
+	OFFSET=$(get_partition_param $PARTITION OFFSET)
+	SIZE=$(get_partition_param $PARTITION SIZE)
+	TYPE=$(get_partition_param $PARTITION TYPE)
+
+	# No need to do anything with files for now
+	[ "$FORMAT" = "file" ] && continue
+
+	# Process default
+	[ "$OFFSET" = "default" ] && OFFSET=$pos
+	[ "$SIZE" = "default" ] && SIZE=$((total-pos))
+	[ "$TYPE" = "default" ] && TYPE=83
+	
+	# do we have a bootable flag
+	if [ "${TYPE%\*}" != "$TYPE" ]; then
+		BOOT="*"
+		TYPE=${TYPE%\*}
+	fi
+
+	# convert everything to bytes
+	OFFSET=$(convert_to_bytes $OFFSET)
+	SIZE=$(convert_to_bytes $SIZE)
+	pos=$((pos+OFFSET+SIZE))
+
+	# convert everything to sectors
+	OFFSET=$(convert_to_sectors $OFFSET)
+	SIZE=$(convert_to_sectors $SIZE)
+
+	echo "$OFFSET,$SIZE,$TYPE,$BOOT"
+done | $SUDO sfdisk $SDCARD -C $cylinders -S $sectors -H $heads -u=sectors --force &> /dev/null
+
+sync && sleep 1
+
+pos=0
+count=1
+partid=1
+while true; do
+	BOOT=""
+	PARTITION=$(eval echo \$P$count);
+
+	[ -z "$PARTITION" ] && break;
+	
+	FORMAT=$(get_partition_param $PARTITION FORMAT)
+	OFFSET=$(get_partition_param $PARTITION OFFSET)
+	SOURCE=$(get_partition_param $PARTITION SOURCE)
+	
+	FORMATOPT=$(get_param_opt $FORMAT)
+	FORMAT=$(get_param_name $FORMAT)
+
+	echo "========== flashing partition $count =========="
+	case $FORMAT in
+		file)
+			if [ -n "$FORMATOPT" ]; then
+				# there will be a skip option to dd
+				IBS=$(get_block_size $FORMATOPT)
+				OBS=$(get_block_size $OFFSET)
+				SKIP=$(get_block_count $FORMATOPT)
+				SEEK=$(get_block_count OFFSET)
+				echo "dd if=$SOURCE of=$SDCARD seek=$OFFSET skip=$FORMATOPT obs=$OBS  ibs=$IBS"
+			else
+				OBS=$(get_block_size $OFFSET)
+				SEEK=$(get_block_count OFFSET)
+				echo "dd if=$SOURCE of=$SDCARD seek=$SEEK obs=$OBS"
+			fi
+
+			;;
+		archive)
+			FS=$FORMATOPT
+			if [ -n "$FS" ]; then
+				mkdir -p /tmp/.mnt
+				$SUDO mkfs.$FS $SDCARD_PART$partid
+				$SUDO mount $SDCARD_PART$partid /tmp/.mnt
+				$SUDO tar xf $SOURCE -C /tmp/.mnt
+				sync
+				$SUDO umount $SDCARD_PART$partid
+			fi
+			partid=$((partid+1))
+			;;
+		partition)
+			FS=$FORMATOPT
+			if [ -z "$FS" ]; then
+				if [ "$SOURCE" != "default" ]; then
+					dd if=$SOURCE of=$SDCARD_PART$partid
+				fi
+			else
+				$SUDO mkfs.$FS $SDCARD_PART$partid
+			fi
+			partid=$((partid+1))
+			;;
+		*)
+			echo "unknow type $FORMAT"
+			;;
+	esac
+
+	count=$((count+1))
+done 
+
+sync
+
+echo "========== done =========="
+
